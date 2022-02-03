@@ -271,7 +271,8 @@ static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 	// At this point, fi->fh is an int representing a pointer to
 	// the relevant directory stream. We have to cast to get back.
-	while ((de = readdir((DIR *)fi->fh)) != NULL)
+	// Including an intermediate unitptr_t cast avoids a compiler warning.
+	while ((de = readdir((DIR *)(uintptr_t)fi->fh)) != NULL)
 	{
 		// Make a new stat struct.
 		struct stat st;
@@ -300,7 +301,8 @@ static int fuzzyfs_releasedir(const char *path, struct fuse_file_info *fi)
 	int res;
 
         // Close the directory stream, again casting.
-        res = closedir((DIR *)fi->fh);
+	// Including an intermediate unitptr_t cast avoids a compiler warning.
+        res = closedir((DIR *)(uintptr_t)fi->fh);
         // If there was an error, pass it through.
         if (res == -1)
         {
