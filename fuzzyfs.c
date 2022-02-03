@@ -19,6 +19,10 @@
 #define FUSE_USE_VERSION 26
 #define TRUE 1
 #define FALSE 0
+// The factor by which the memo dictionary multiplies its size when it's out of room.
+#define SCALING_FACTOR 2
+// The number of entries the memo dictionary should start out with.
+#define MEMODICT_INIT_SIZE 32
 
 #include <assert.h>
 #include <dirent.h>
@@ -31,10 +35,220 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static const char* DOT = ".";
 
 const char* root = NULL;
+
+// TODO: use fast-compare instead of strcmp for everything.
+
+// Many thanks to https://stackoverflow.com/a/3536261, whose code I modified for this.
+// This is essentially a hash table, but without the hashes.
+typedef struct
+{
+	// An array to hold the input char*'s.
+	char **input;
+	// An array to hold the output char*'s.
+	char **output;
+	// Output and input will always have the same size and number of elements used.
+	size_t used;
+	size_t size;
+} DynamicDictionary;
+
+// This is the instance of the dictionary that we will be using.
+static DynamicDictionary memoDict;
+// A lock for reading and writing to the dictionary.
+static pthread_mutex_t memoLock;
+
+// Initialize the memo dictionary to a given size.
+void initDDict(DynamicDictionary *d, size_t initialSize)
+{
+	// Whatever the initial size is
+	d->input = malloc(initialSize * sizeof(char*));
+	d->output = malloc(initialSize * sizeof(char*));
+	// The number of elements used. Also works as an index for the first empty slot.
+	d->used = 0;
+	// The total size of the dictionary.
+	d->size = initialSize;
+}
+
+/* Below are three insertDDict variants.
+ *
+ * One of them calls strdup on both arguments, and places the results
+ * in the dictionary. This one is the most standard, but it could induce
+ * overhead from any unneeded strdups. I haven't used it, so I commented it out.
+ *
+ * The second will strdup the input but not the output. This allows us to
+ * use slightly cleaner syntax when calling it, and it avoids an extra strdup.
+ *
+ * The third takes only one argument, strdup's it, and points both the input
+ * and output to that. It's for cases in which we want to cache an unmodified
+ * input-output "pair" without using extra memory.
+ *
+ * An astute observer may note that we always strdup the input. This is because
+ * the input is either a pointer to a FUSE path (managed and freed separately by
+ * FUSE) or a pointer to DOT, which is a read-only static string. If it's the latter,
+ * we have used only one unneeded byte of memory and performed only one unneeded
+ * strdup. This can only occur once because it will be memoized. I don't think
+ * this is an important consideration.
+ *
+ * Speaking of important considerations: thread-safety! None of the DynamicDictionary
+ * functions are thread-safe: you'll have to ensure that your caller locks around
+ * them properly.
+ */
+
+// Insert an element into the dictionary, expanding if needed.
+/*void insertDDict(DynamicDictionary *d, char *in, char *out)
+{
+	// If this dictionary has already been freed or is uninitialized,
+	if (d->input == NULL || d->output == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If we're getting passed invalid strings,
+	if (in == NULL || out == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If the next empty slot is out-of-bounds,
+	if (d->used == d->size)
+	{
+		// Increase the size by a factor of SCALING_FACTOR.
+		d->size = (int)(SCALING_FACTOR * d->size);
+		// Call realloc to expand the input and output arrays.
+		d->input = realloc(d->input, d->size * sizeof(char*));
+		d->output = realloc(d->output, d->size * sizeof(char*));
+	}
+	// Insert the element. Note: this allocates new memory.
+	d->input[d->used] = strdup(in);
+	d->output[d->used] = strdup(out);
+	// Increment the number of used elements.
+	d->used++;
+}*/
+
+// Insert an element into the dictionary, expanding if needed.
+// This version doesn't call strdup() on the out string, just the in string.
+// This should improve performance in some instances.
+// Beware though: you can't go free out later, if you use this!
+void insertDDict_noOutStrdup(DynamicDictionary *d, char *in, char *out)
+{
+	// If this dictionary has already been freed or is uninitialized,
+	if (d->input == NULL || d->output == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If we're getting passed invalid strings,
+	if (in == NULL || out == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If the next empty slot is out-of-bounds,
+	if (d->used == d->size)
+	{
+		// Increase the size by a factor of SCALING_FACTOR.
+		d->size = (int)(SCALING_FACTOR * d->size);
+		// Call realloc to expand the input and output arrays.
+		d->input = realloc(d->input, d->size * sizeof(char*));
+		d->output = realloc(d->output, d->size * sizeof(char*));
+	}
+	// Insert the element. Note: this allocates new memory, but only for input.
+	d->input[d->used] = strdup(in);
+	d->output[d->used] = out;
+	// Increment the number of used elements.
+	d->used++;
+}
+
+// Insert an element into the dictionary, expanding it if needed.
+// This version inserts the same string into input and output.
+// For when the input is the same as the output, and we want to save memory.
+void insertDDict_noMod(DynamicDictionary *d, char *in_and_out)
+{
+	// If this dictionary has already been freed or is uninitialized,
+	if (d->input == NULL || d->output == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If we're getting passed invalid strings,
+	if (in_and_out == NULL)
+	{
+		// Do nothing.
+		return;
+	}
+	// If the next empty slot is out-of-bounds,
+	if (d->used == d->size)
+	{
+		// Increase the size by a factor of SCALING_FACTOR.
+		d->size = (int)(SCALING_FACTOR * d->size);
+		// Call realloc to expand the input and output arrays.
+		d->input = realloc(d->input, d->size * sizeof(char*));
+		d->output = realloc(d->output, d->size * sizeof(char*));
+	}
+	// Insert the element. Note: this allocates new memory.
+	d->input[d->used] = strdup(in_and_out);
+	d->output[d->used] = d->input[d->used];
+	// Increment the number of used elements.
+	d->used++;
+}
+
+// Check if the dictionary contains an input value that is the same as in.
+// Returns the corresponding output value if found, and null otherwise.
+char* searchDDict(DynamicDictionary *d, char *in)
+{
+	// If this dictionary has already been freed or is uninitialized,
+	if (d->input == NULL || d->output == NULL)
+	{
+		// Do nothing.
+		return NULL;
+	}
+	if (in == NULL)
+	{
+		return NULL;
+	}
+	// Loop over every element. Note: We search backwards so that the recently-stored
+	// elements get faster results.
+	// TODO: maybe for absolutely enormous arrays, we make d->input
+	// be sorted, and then we can use a binary search here instead of the linear one.
+	for (int i = d->used - 1; i >= 0; i--)
+	{
+		// If the input strings match,
+		if (strcmp(in, d->input[i]) == 0)
+		{
+			// We found it! Return a pointer to the output string.
+			return d->output[i];
+		}
+	}
+	// It wasn't found. Return null.
+	return NULL;
+}
+
+// Free all the memory associated with the dynamic dictionary.
+void freeDDict(DynamicDictionary *d)
+{
+	// For every element,
+	for (int i = 0; i < d->used; i++)
+	{
+		// Free the input-output pair.
+		// Don't bother setting their pointers to null:
+		// we're about to free the whole array.
+		free(d->input[i]);
+		free(d->output[i]);
+	}
+	// All the elments are freed, free the arrays
+	// themselves and set their pointers to null.
+	free(d->input);
+	d->input = NULL;
+	free(d->output);
+	d->output = NULL;
+	// Set the size and number-of-used-elements to zero.
+	d->used = 0;
+	d->size = 0;
+}
 
 /*
  * If the requested path is '/', returns DOT.
@@ -70,7 +284,7 @@ const char* fix_path(const char* path)
  * current chunk's parent directory (constructed from previous case-corrected chunks) that
  * case-insensitively match the current chunk. If one is found, the current chunk is corrected.
  * This repeats until the entire path is case-corrected. The case-corrected path is returned.
-*/
+ */
 char* fix_path_case(const char* path)
 {
 	char *p;
@@ -182,37 +396,65 @@ static int fuzzyfs_getattr(const char *path, struct stat *stbuf)
 {
 	int res;
 	char *p;
+	char *strRes;
 
-	// Fix the path. and try to get the file attributes.
+	// Increment past any leading slashes.
 	p = (char*)fix_path(path);
-	// The file attributes should be put in stbuf.
-	res = lstat(p, stbuf);
-	// It worked? Return zero.
-	if (!res)
-	{
-		return 0;
-	}
 
-	// If the error code is anything but ENOENT ("file not found"), return it.
-	if (errno != ENOENT)
+	// Lock: We're about to read/write memoDict.
+	pthread_mutex_lock(&memoLock);
+	// Pass a pointer to memoDict.
+	// Also, remember: p currently points to memory allocated for path.
+	// Note: if this succeeds, it just returns a pointer to somewhere in the dictionary.
+	// Don't you dare try to free it.
+	strRes = searchDDict(&memoDict, p);
+	// If the search failed...
+	if (strRes == NULL)
 	{
-		return -errno;
-	}
+		// Just try without any modifications.
+		// The file attributes should be put in stbuf.
+		res = lstat(p, stbuf);
+		// It worked? Return zero.
+		if (!res)
+		{
+			// Also put it in the memoDict.
+			// The string requires no modification, so we can use noMod.
+			insertDDict_noMod(&memoDict, p);
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			return 0;
+		}
 
-	// The error was ENOENT.
-	// See if fix_path_case finds anything.
-	// Note: this allocates new memory for p, unless it returns an error.
-	if (!(p = fix_path_case(p)))
-	{
-		// It doesn't. Return ENOENT.
-		return -ENOENT;
-	}
+		// If the error code is anything but ENOENT ("file not found"), return it.
+		if (errno != ENOENT)
+		{
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// We found nothing, so no memo.
+			return -errno;
+		}
 
-	// fix_path_case did find something. Put that thing's file attributes in stbuf.
-	res = lstat(p, stbuf);
-	// Free the memory for p.
-	free(p);
-	p = NULL;
+		// The error was ENOENT.
+		// See if fix_path_case finds anything.
+		// Note: this allocates new memory for p, unless it returns an error.
+		if (!(strRes = fix_path_case(p)))
+		{
+			// It doesn't. Return ENOENT.
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// Again, nothing found. No memo.
+			return -ENOENT;
+		}
+
+		// fix_path_case did find something.
+		// Memoize! This function won't strdup strRes, so we won't free strRes either.
+		insertDDict_noOutStrdup(&memoDict, p, strRes);
+	}
+	// Unlock: we're done reading and writing to memoDict.
+	pthread_mutex_unlock(&memoLock);
+
+	// Put the result's attributes in stbuf.
+	res = lstat(strRes, stbuf);
 	// Unless lstat errored out, return zero.
 	assert(res != -1);
 	return 0;
@@ -222,41 +464,71 @@ static int fuzzyfs_getattr(const char *path, struct stat *stbuf)
 static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 			   off_t offset, struct fuse_file_info *fi)
 {
-	DIR *dp;
+	DIR *dp = NULL;
 	struct dirent *de;
 	char *p;
+	char *strRes;
 
 	(void) offset;
 	(void) fi;
 
 	// Increment past the leading slash, if any.
 	p = (char*)fix_path(path);
-	// Try to open the directory normally.
-	dp = opendir(p);
-	// If it didn't work,
-	if (dp == NULL)
+
+	// Lock: We're about to read/write memoDict.
+	pthread_mutex_lock(&memoLock);
+	// Pass a pointer to memoDict.
+	// Also, remember: p currently points to memory allocated for path.
+	// Note: if this succeeds, it just returns a pointer to somewhere in the dictionary.
+	// Don't you dare try to free it.
+	strRes = searchDDict(&memoDict, p);
+
+	// If the search failed...
+	if (strRes == NULL)
 	{
-		// If the error was anything but ENOENT, return that error.
-		if (errno != ENOENT)
+		// Try to open the directory without path modification.
+		dp = opendir(p);
+		// Check if it worked.
+		if (dp != NULL)
 		{
+			// If it did work without modification, memoize that result.
+			insertDDict_noMod(&memoDict, p);
+		}
+		// Else-cases: it didn't work.
+		// If the error was anything but ENOENT, return that error.
+		else if (errno != ENOENT)
+		{
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// Nothing found, so no memo.
 			return -errno;
 		}
-
-		// If the error was an ENOENT, check if fix_path_case fixes it.
-		if (!(p = fix_path_case(p)))
+		// The error was ENOENT.
+		// See if fix_path_case finds anything.
+		else if (!(strRes = fix_path_case(p)))
 		{
-			// No? Return ENOENT.
+			// It found nothing. Unlock and return ENOENT.
+			pthread_mutex_unlock(&memoLock);
+			// Again, nothing found. No memo.
 			return -ENOENT;
 		}
-
-		// Open the fixed directory.
-		dp = opendir(p);
-		// fix_path_case allocated new memory. Free it.
-		free(p);
-		p = NULL;
-		// If the directory failed to open, bail out.
-		assert(dp != NULL);
+		// fix_path_case did find something.
+		else
+		{
+			// Memoize! This function won't strdup strRes, so we won't free strRes either.
+			insertDDict_noOutStrdup(&memoDict, p, strRes);
+		}
 	}
+	// Unlock: we're done reading and writing to memoDict.
+	pthread_mutex_unlock(&memoLock);
+	// If dp is still null...
+	if (dp == NULL)
+	{
+		// strRes should at this point hold a valid path. Try to open it.
+		dp = opendir(strRes);
+	}
+	// Assert that it worked.
+	assert(dp != NULL);
 
 	// At this point, we have either bailed out or placed the directory stream in dp.
 	while ((de = readdir(dp)) != NULL)
@@ -285,38 +557,68 @@ static int fuzzyfs_open(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 	char *p;
+	char *strRes;
 
 	// Increment past the leading slash, if any.
 	p = (char*)fix_path(path);
-	// Try to open the file normally.
-	res = open(p, fi->flags);
 
-	// If it worked...
-	if (res != -1)
+	// Lock: We're about to read/write memoDict.
+	pthread_mutex_lock(&memoLock);
+	// Pass a pointer to memoDict.
+	// Also, remember: p currently points to memory allocated for path.
+	// Note: if this succeeds, it just returns a pointer to somewhere in the dictionary.
+	// Don't you dare try to free it.
+	strRes = searchDDict(&memoDict, p);
+	// If the search failed...
+	if (strRes == NULL)
 	{
-		// Close the file descriptor and return zero.
-		close(res);
-		return 0;
-	}
+		// Try to open the file normally.
+		res = open(p, fi->flags);
 
-	// If it gave an error other than ENOENT, return that error.
-	if (errno != ENOENT)
-	{
-		return -errno;
-	}
+		// It worked? Return zero.
+		if (res != -1)
+		{
+			// Also put it in the memoDict.
+			// The string requires no modification, so we can use noMod.
+			insertDDict_noMod(&memoDict, p);
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// Close the file descriptor and return zero.
+			close(res);
+			return 0;
+		}
 
-	// If it gave ENOENT, see if fix_path_case can fix it.
-	if (!(p = fix_path_case(p)))
-	{
-		// If it can't, return ENOENT.
-		return -ENOENT;
+		// If the error code is anything but ENOENT ("file not found"), return it.
+		if (errno != ENOENT)
+		{
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// We found nothing, so no memo.
+			return -errno;
+		}
+
+		// The error was ENOENT.
+		// See if fix_path_case finds anything.
+		// Note: this allocates new memory for p, unless it returns an error.
+		if (!(strRes = fix_path_case(p)))
+		{
+			// It doesn't. Return ENOENT.
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
+			// Again, nothing found. No memo.
+			return -ENOENT;
+		}
+
+		// fix_path_case did find something.
+		// Memoize! This function won't strdup strRes, so we won't free strRes either.
+		insertDDict_noOutStrdup(&memoDict, p, strRes);
 	}
+	// Unlock: we're done reading and writing to memoDict.
+	pthread_mutex_unlock(&memoLock);
 
 	// If it can, open it.
-	res = open(p, fi->flags);
-	// Then free p (allocated by fix_path_case) and close the file descriptor.
-	free(p);
-	p = NULL;
+	res = open(strRes, fi->flags);
+	// Then close the file descriptor.
 	close(res);
 	// As long as there were no errors, return zero.
 	assert(res != -1);
@@ -327,38 +629,64 @@ static int fuzzyfs_open(const char *path, struct fuse_file_info *fi)
 static int fuzzyfs_read(const char *path, char *buf, size_t size, off_t offset,
 			struct fuse_file_info *fi)
 {
-	int fd;
+	int fd = -1;
 	int res;
 	char *p;
+	char *strRes;
 
 	(void) fi;
 
 	// Increment past the leading slash, if any.
 	p = (char*)fix_path(path);
-	// Try to open it read-only without modifications.
-	fd = open(p, O_RDONLY);
-	// If it failed...
-	if (fd == -1)
+	// Lock: We're about to read/write memoDict.
+	pthread_mutex_lock(&memoLock);
+	// Pass a pointer to memoDict.
+	// Also, remember: p currently points to memory allocated for path.
+	// Note: if this succeeds, it just returns a pointer to somewhere in the dictionary.
+	// Don't you dare try to free it.
+	strRes = searchDDict(&memoDict, p);
+	// If the search failed...
+	if (strRes == NULL)
 	{
-		// If the error was not an ENOENT, return that error.
-		if (errno != ENOENT)
+		// Try to open it read-only without modifications.
+		fd = open(p, O_RDONLY);
+
+		// It worked? Memoize it.
+		if (fd != -1)
 		{
+			// The string requires no modification, so we can use noMod.
+			insertDDict_noMod(&memoDict, p);
+		}
+		// If the error was not an ENOENT, return that error.
+		else if (errno != ENOENT)
+		{
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
 			return -errno;
 		}
-
 		// If it gave ENOENT, see if fix_path_case can fix it.
-		if (!(p = fix_path_case(p)))
+		else if (!(strRes = fix_path_case(p)))
 		{
 			// If it can't, return ENOENT.
+			// Unlock: we're done reading and writing to memoDict.
+			pthread_mutex_unlock(&memoLock);
 			return -ENOENT;
 		}
-
-		// Open the case_corrected file read-only.
-		fd = open(p, O_RDONLY);
-		// Free the memory that fix_path_case allocated.
-		free(p);
-		p = NULL;
-		// Assert that we opened it correctly.
+		// fix_path_case did find something.
+		else
+		{
+			// Memoize! This function won't strdup strRes, so we won't free strRes either.
+			insertDDict_noOutStrdup(&memoDict, p, strRes);
+		}
+	}
+	// Unlock: we're done reading and writing to memoDict.
+	pthread_mutex_unlock(&memoLock);
+	// If fd is still -1...
+	if (fd == -1)
+	{
+		// Open the file read-only.
+		fd = open(strRes, O_RDONLY);
+		// Asser that it worked.
 		assert(fd != -1);
 	}
 
@@ -387,6 +715,16 @@ static void *fuzzyfs_init(struct fuse_conn_info *conn)
 	}
 
 	return NULL;
+}
+
+static void fuzzyfs_destroy(void *private_data)
+{
+	// We're about to free the DDict, so we lock.
+	pthread_mutex_lock(&memoLock);
+	freeDDict(&memoDict);
+	pthread_mutex_unlock(&memoLock);
+	// Destroy the mutex.
+	pthread_mutex_destroy(&memoLock);
 }
 
 static int fuzzyfs_opt_parse(void *data, const char *arg, int key,
@@ -420,10 +758,18 @@ static struct fuse_operations fuzzyfs_oper = {
 	.open		= fuzzyfs_open,
 	.read		= fuzzyfs_read,
 	.init		= fuzzyfs_init,
+	.destroy	= fuzzyfs_destroy,
 };
 
 int main(int argc, char *argv[])
 {
+	// Init the mutex lock.
+	pthread_mutex_init(&memoLock, NULL);
+	// We're about to initialize the memoDict, so we lock.
+	pthread_mutex_lock(&memoLock);
+	initDDict(&memoDict, MEMODICT_INIT_SIZE);
+	pthread_mutex_unlock(&memoLock);
+
 	// Parse the args.
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	fuse_opt_parse(&args, NULL, NULL, fuzzyfs_opt_parse);
