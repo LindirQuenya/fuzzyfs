@@ -234,10 +234,18 @@ void freeDDict(DynamicDictionary *d)
 	for (int i = 0; i < d->used; i++)
 	{
 		// Free the input-output pair.
-		// Don't bother setting their pointers to null:
-		// we're about to free the whole array.
 		free(d->input[i]);
-		free(d->output[i]);
+		// Check that the input-output pair isn't a noMod.
+		if (d->input[i] != d->output[i])
+		{
+			// If they're different, free the second as well.
+			// We wouldn't want a double free.
+			free(d->output[i]);
+		}
+		// Set the pointers to null, just in case some
+		// madman tries accessing them after freeing the dict.
+		d->input[i] = NULL;
+		d->output[i] = NULL;
 	}
 	// All the elments are freed, free the arrays
 	// themselves and set their pointers to null.
