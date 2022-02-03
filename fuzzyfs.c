@@ -32,16 +32,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char* DOT = ".";
+static const char *DOT = ".";
 
-const char* root = NULL;
+const char *root = NULL;
 
 /*
  * If the requested path is '/', returns DOT.
  * If the requested path starts with '/', strips the leading '/' off.
  * Leaves the string otherwise untouched.
  */
-const char* fix_path(const char* path)
+const char* fix_path(const char *path)
 {
 	// Make p, which points to the same thing as path.
 	const char *p = path;
@@ -71,7 +71,7 @@ const char* fix_path(const char* path)
  * case-insensitively match the current chunk. If one is found, the current chunk is corrected.
  * This repeats until the entire path is case-corrected. The case-corrected path is returned.
 */
-char* fix_path_case(const char* path)
+char* fix_path_case(const char *path)
 {
 	char *p;
 	DIR *dp;
@@ -218,16 +218,11 @@ static int fuzzyfs_getattr(const char *path, struct stat *stbuf)
 	return 0;
 }
 
-// Reads the contents of a directory.
-static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-			   off_t offset, struct fuse_file_info *fi)
+// Open a directory stream and put it in fi->fh.
+static int fuzzyfs_opendir(const char *path, struct fuse_file_info *fi)
 {
 	DIR *dp;
-	struct dirent *de;
 	char *p;
-
-	(void) offset;
-	(void) fi;
 
 	// Increment past the leading slash, if any.
 	p = (char*)fix_path(path);
@@ -254,12 +249,29 @@ static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		// fix_path_case allocated new memory. Free it.
 		free(p);
 		p = NULL;
-		// If the directory failed to open, bail out.
-		assert(dp != NULL);
 	}
+	// Make fh point to the directory stream.
+	// fi->fh is a uint64_t, so we must cast. Casting directly to uint64_t
+	// generates a compiler warning, so we use uintptr_t.
+	fi->fh = (uintptr_t) dp;
+	// If the directory failed to open, bail out.
+	assert(dp != NULL);
+	return 0;
+}
 
-	// At this point, we have either bailed out or placed the directory stream in dp.
-	while ((de = readdir(dp)) != NULL)
+// Reads the contents of a directory.
+static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			   off_t offset, struct fuse_file_info *fi)
+{
+	// Discard path and offset. We need neither.
+	(void) path;
+	(void) offset;
+
+	struct dirent *de;
+
+	// At this point, fi->fh is an int representing a pointer to
+	// the relevant directory stream. We have to cast to get back.
+	while ((de = readdir((DIR *)fi->fh)) != NULL)
 	{
 		// Make a new stat struct.
 		struct stat st;
@@ -275,12 +287,31 @@ static int fuzzyfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 			break;
 		}
 	}
-	// Close the directory and return zero.
-	closedir(dp);
+
 	return 0;
 }
 
-// Basic check that a file exists.
+// Close the directory stream pointed to by fi->fh.
+static int fuzzyfs_releasedir(const char *path, struct fuse_file_info *fi)
+{
+	// Discard the path.
+	(void) path;
+
+	int res;
+
+        // Close the directory stream, again casting.
+        res = closedir((DIR *)fi->fh);
+        // If there was an error, pass it through.
+        if (res == -1)
+        {
+                res = -errno;
+        }
+
+        // Return whatever retval we have at this point.
+        return res;
+}
+
+// Open a file handle and put it in fi->fh.
 static int fuzzyfs_open(const char *path, struct fuse_file_info *fi)
 {
 	int res;
@@ -294,8 +325,8 @@ static int fuzzyfs_open(const char *path, struct fuse_file_info *fi)
 	// If it worked...
 	if (res != -1)
 	{
-		// Close the file descriptor and return zero.
-		close(res);
+		// Set the file descriptor and return zero.
+		fi->fh = res;
 		return 0;
 	}
 
@@ -312,70 +343,65 @@ static int fuzzyfs_open(const char *path, struct fuse_file_info *fi)
 		return -ENOENT;
 	}
 
-	// If it can, open it.
+	// If fix_path_case found something, we can open it.
 	res = open(p, fi->flags);
-	// Then free p (allocated by fix_path_case) and close the file descriptor.
+	// Then free p (allocated by fix_path_case).
 	free(p);
 	p = NULL;
-	close(res);
+	// Set the file handle.
+	fi->fh = res;
 	// As long as there were no errors, return zero.
 	assert(res != -1);
 	return 0;
 }
 
-// Read size bytes from the given file into the buffer buf, beginning offset bytes into the file.
+// Read size bytes from the given file descriptor into the buffer buf, beginning offset bytes into the file.
 static int fuzzyfs_read(const char *path, char *buf, size_t size, off_t offset,
 			struct fuse_file_info *fi)
 {
-	int fd;
+	// Discard the path. We use file handles.
+	(void) path;
+
 	int res;
-	char *p;
-
-	(void) fi;
-
-	// Increment past the leading slash, if any.
-	p = (char*)fix_path(path);
-	// Try to open it read-only without modifications.
-	fd = open(p, O_RDONLY);
-	// If it failed...
-	if (fd == -1)
-	{
-		// If the error was not an ENOENT, return that error.
-		if (errno != ENOENT)
-		{
-			return -errno;
-		}
-
-		// If it gave ENOENT, see if fix_path_case can fix it.
-		if (!(p = fix_path_case(p)))
-		{
-			// If it can't, return ENOENT.
-			return -ENOENT;
-		}
-
-		// Open the case_corrected file read-only.
-		fd = open(p, O_RDONLY);
-		// Free the memory that fix_path_case allocated.
-		free(p);
-		p = NULL;
-		// Assert that we opened it correctly.
-		assert(fd != -1);
-	}
 
 	// Read from the file descriptor.
-	res = pread(fd, buf, size, offset);
+	res = pread(fi->fh, buf, size, offset);
 	// If there was an error, pass it through.
 	if (res == -1)
 	{
 		res = -errno;
 	}
 
-	// Close the file descriptor.
-	close(fd);
 	// Return whatever retval we get.
 	return res;
 }
 
+// Close the file descriptor.
+static int fuzzyfs_release(const char *path, struct fuse_file_info *fi)
+{
+	// Discard the path. We use file handles.
+	(void) path;
+
+	int res;
+
+	// Close the file descriptor.
+	res = close(fi->fh);
+	// If there was an error, pass it through.
+	if (res == -1)
+	{
+		res = -errno;
+	}
+
+	// Return whatever retval we have at this point.
+	return res;
+}
+
+/*
+ * A function called at the filesystem startup.
+ * Changes directory to the first argument (the source) so that
+ * we can assume that the source is '.', instead of doing nasty
+ * directory-symlink appending.
+ */
 static void *fuzzyfs_init(struct fuse_conn_info *conn)
 {
 	// cd into the root directory, wherever that is.
@@ -389,6 +415,7 @@ static void *fuzzyfs_init(struct fuse_conn_info *conn)
 	return NULL;
 }
 
+// Parse the arguments. Notably, sets root to the first argument (the source).
 static int fuzzyfs_opt_parse(void *data, const char *arg, int key,
 			     struct fuse_args *outargs)
 {
@@ -416,9 +443,12 @@ static int fuzzyfs_opt_parse(void *data, const char *arg, int key,
 // Setup the mapping between the fuse functions and the fuzzyfs functions.
 static struct fuse_operations fuzzyfs_oper = {
 	.getattr	= fuzzyfs_getattr,
+	.opendir	= fuzzyfs_opendir,
 	.readdir	= fuzzyfs_readdir,
+	.releasedir	= fuzzyfs_releasedir,
 	.open		= fuzzyfs_open,
 	.read		= fuzzyfs_read,
+	.release	= fuzzyfs_release,
 	.init		= fuzzyfs_init,
 };
 
